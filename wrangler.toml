@@ -1,0 +1,6 @@
+name = "skpods-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+
+[build]
+command = "worker-build --release"
