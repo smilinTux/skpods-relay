@@ -2,7 +2,7 @@ name = "skpods-relay"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-11-01"
 workers_dev = true
-routes = [{ pattern = "relay.skpods.skworld.io", custom_domain = true }]
+routes = [{ pattern = "relay.skpods.id", custom_domain = true }]
 
 [build]
 command = "worker-build --release"
