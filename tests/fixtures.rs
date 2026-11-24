@@ -101,3 +101,26 @@ fn room_id_must_be_32_hex() {
     assert!(!valid_room_id("0123456789abcdef0123456789abcdeg"));
     assert!(!valid_room_id(""));
 }
+
+#[test]
+fn queued_frame_matches_fixture() {
+    use skpods_relay::frames::Kind;
+    use skpods_relay::mailbox::QueuedItem;
+    let want = fixtures()
+        .into_iter()
+        .find(|f| f["name"] == "queued ok")
+        .unwrap()["frame"]
+        .clone();
+    let items = vec![QueuedItem {
+        room: "0123456789abcdef0123456789abcdef".into(),
+        from: "https://alice.pods.example/profile/card#me".into(),
+        kind: Kind::Message,
+        url: "https://alice.pods.example/skpods/v1/chat/c-ab12/m-1732449600000-x9k2.ttl".into(),
+        seq: 7,
+        at: 1732449600000,
+    }];
+    let got: Value = serde_json::from_str(&ServerFrame::Queued(&items).to_json()).unwrap();
+    assert_eq!(got, want);
+    let empty: Value = serde_json::from_str(&ServerFrame::Queued(&[]).to_json()).unwrap();
+    assert_eq!(empty, serde_json::json!({"t": "queued", "items": []}));
+}

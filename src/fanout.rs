@@ -35,6 +35,20 @@ pub fn plan<'a>(sockets: &[SocketView<'_>], members: &'a [String]) -> Fanout<'a>
     Fanout { live, offline }
 }
 
+/// A room forwards to an offline member's mailbox at most once per this
+/// long (ruling R10); later pings inside the window are dropped for that
+/// member, who re-polls on reconnect anyway.
+pub const FORWARD_EVERY_MS: i64 = 30_000;
+
+/// Whether a member last forwarded at `last` (epoch ms) may be forwarded
+/// again at `now`. A `last` in the future (clock step) counts as due.
+pub fn forward_due(last: Option<i64>, now: i64) -> bool {
+    match last {
+        None => true,
+        Some(t) => t > now || now - t >= FORWARD_EVERY_MS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +93,16 @@ mod tests {
         let f = plan(&sockets, &members);
         assert!(f.live.is_empty());
         assert_eq!(f.offline, vec![a]);
+    }
+
+    #[test]
+    fn forwards_at_most_once_per_30s() {
+        let now = 1_000_000;
+        assert!(forward_due(None, now));
+        assert!(!forward_due(Some(now), now));
+        assert!(!forward_due(Some(now - FORWARD_EVERY_MS + 1), now));
+        assert!(forward_due(Some(now - FORWARD_EVERY_MS), now));
+        // A clock step backwards does not block forwards forever.
+        assert!(forward_due(Some(now + 5 * FORWARD_EVERY_MS), now));
     }
 }

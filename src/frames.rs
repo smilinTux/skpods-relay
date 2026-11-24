@@ -4,7 +4,10 @@
 //! code to close code table. No Workers APIs here, so it runs under
 //! `cargo test` on the host.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+use crate::mailbox::QueuedItem;
 
 /// Largest accepted frame, in UTF-8 bytes of the whole text frame.
 pub const MAX_FRAME_BYTES: usize = 4096;
@@ -15,7 +18,8 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// Fields only the relay may set. A client frame carrying any of them is refused.
 const RELAY_ONLY_FIELDS: [&str; 3] = ["from", "seq", "at"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Message,
     Edit,
@@ -207,6 +211,8 @@ pub enum ServerFrame<'a> {
     Typing {
         from: &'a str,
     },
+    /// Mailbox delivery: the drained queue on connect, or one live item.
+    Queued(&'a [QueuedItem]),
     Error(ErrorCode),
 }
 
@@ -229,6 +235,7 @@ impl ServerFrame<'_> {
                 "at": at,
             }),
             ServerFrame::Typing { from } => json!({"t": "typing", "from": from}),
+            ServerFrame::Queued(items) => json!({"t": "queued", "items": items}),
             ServerFrame::Error(code) => json!({"t": "error", "code": code.as_str()}),
         };
         v.to_string()

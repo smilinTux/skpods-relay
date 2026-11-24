@@ -11,28 +11,28 @@
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{
-    console_log, durable_object, Date, DurableObject, Env, Headers, Method, Request, RequestInit,
+    console_log, durable_object, DurableObject, Env, Headers, Method, Request, RequestInit,
     Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
-use crate::auth::{self, AuthError};
-use crate::fanout::{self, SocketView};
+use crate::fanout::{self, forward_due, SocketView};
 use crate::frames::{check_order, parse, ClientFrame, ErrorCode, Kind, ServerFrame};
+use crate::gate::{self, now_ms};
 use crate::ids::{sha256_hex, valid_room_id};
-use crate::limits::{RateLimiter, AUTH_TIMEOUT_MS, JTI_KEEP, MAX_MEMBERS, WINDOW_MS};
+use crate::limits::{RateLimiter, AUTH_TIMEOUT_MS, MAX_MEMBERS};
 use crate::mailbox::{QueuedItem, ENQUEUE_URL};
 use crate::profile::FetchDirectory;
 
-/// A verified WebID longer than this is refused, which keeps the socket
-/// attachment well inside its 2 KB limit.
-const MAX_WEBID_BYTES: usize = 1024;
+const TAG: &str = "room";
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS members(webid TEXT PRIMARY KEY, last_seen INTEGER);
+CREATE TABLE IF NOT EXISTS members(webid TEXT PRIMARY KEY, last_seen INTEGER, last_forward INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
-CREATE TABLE IF NOT EXISTS jti(jti TEXT PRIMARY KEY, exp INTEGER);
-CREATE TABLE IF NOT EXISTS auth_hits(at INTEGER);
 ";
+
+/// Rooms created before ruling R10 lack `last_forward`. Fails harmlessly
+/// once the column exists.
+const ADD_LAST_FORWARD: &str = "ALTER TABLE members ADD COLUMN last_forward INTEGER";
 
 /// Per-socket state, kept in the hibernatable attachment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +47,11 @@ struct Attachment {
     webid: Option<String>,
     #[serde(default)]
     rl: Option<RateLimiter>,
+    /// Set while an auth frame is being verified; a second auth arriving
+    /// meanwhile is `bad_frame`, so one socket cannot end up with two
+    /// identities.
+    #[serde(default)]
+    pending: bool,
 }
 
 #[derive(Deserialize)]
@@ -60,36 +65,13 @@ struct V {
 }
 
 #[derive(Deserialize)]
-struct At {
-    at: i64,
-}
-
-#[derive(Deserialize)]
 struct Member {
     webid: String,
+    last_forward: Option<i64>,
 }
 
-fn now_ms() -> i64 {
-    Date::now().as_millis() as i64
-}
-
-fn auth_reason(e: &AuthError) -> &'static str {
-    match e {
-        AuthError::Malformed => "malformed",
-        AuthError::BadSignature => "bad_signature",
-        AuthError::Expired => "expired",
-        AuthError::ProofMismatch => "proof_mismatch",
-        AuthError::ProofStale => "proof_stale",
-        AuthError::IssuerNotTrusted => "issuer_not_trusted",
-        AuthError::Fetch(_) => "fetch",
-    }
-}
-
-/// Send `error` with `code`, then close with the matching close code.
 fn fail(ws: &WebSocket, code: ErrorCode) {
-    console_log!("room error {}", code.as_str());
-    let _ = ws.send_with_str(ServerFrame::Error(code).to_json());
-    let _ = ws.close(Some(code.close()), Some(code.as_str()));
+    gate::fail(ws, code, TAG);
 }
 
 #[durable_object]
@@ -108,45 +90,6 @@ impl Room {
 
     fn attachment(ws: &WebSocket) -> Option<Attachment> {
         ws.deserialize_attachment::<Attachment>().ok().flatten()
-    }
-
-    /// R9: at most 30 verifications per rolling 60 s per object, persisted
-    /// so hibernation does not reset the window.
-    fn auth_allowed(&self, now: i64) -> Result<bool> {
-        let sql = self.sql();
-        let cutoff = now - WINDOW_MS;
-        sql.exec("DELETE FROM auth_hits WHERE at <= ?", vec![cutoff.into()])?;
-        let hits: Vec<At> = sql.exec("SELECT at FROM auth_hits", None)?.to_array()?;
-        let mut rl = RateLimiter::auths(hits.into_iter().map(|h| h.at).collect());
-        if !rl.allow(now) {
-            return Ok(false);
-        }
-        sql.exec("INSERT INTO auth_hits(at) VALUES (?)", vec![now.into()])?;
-        Ok(true)
-    }
-
-    /// Record a proof jti. False when it was seen before (replay).
-    fn take_jti(&self, jti: &str, exp: i64, now_s: i64) -> Result<bool> {
-        let sql = self.sql();
-        sql.exec("DELETE FROM jti WHERE exp < ?", vec![now_s.into()])?;
-        let seen: N = sql
-            .exec(
-                "SELECT COUNT(*) AS n FROM jti WHERE jti = ?",
-                vec![jti.to_string().into()],
-            )?
-            .one()?;
-        if seen.n > 0 {
-            return Ok(false);
-        }
-        sql.exec(
-            "INSERT INTO jti(jti, exp) VALUES (?, ?)",
-            vec![jti.to_string().into(), exp.into()],
-        )?;
-        sql.exec(
-            "DELETE FROM jti WHERE rowid NOT IN (SELECT rowid FROM jti ORDER BY rowid DESC LIMIT ?)",
-            vec![JTI_KEEP.into()],
-        )?;
-        Ok(true)
     }
 
     /// Upsert the member unless that would make more than 50. False when full.
@@ -197,29 +140,18 @@ impl Room {
         proof: &str,
         now: i64,
     ) -> Result<()> {
-        if !self.auth_allowed(now)? {
-            fail(ws, ErrorCode::RateLimited);
-            return Ok(());
-        }
+        att.pending = true;
+        ws.serialize_attachment(&att)?;
         let htu = format!("https://{}/v1/room/{}", att.host, att.room);
-        let now_s = now / 1000;
-        let verified = match auth::verify(token, proof, &htu, now_s, &self.dir).await {
-            Ok(v) => v,
-            Err(e) => {
-                console_log!("room auth refused {}", auth_reason(&e));
-                fail(ws, ErrorCode::AuthFailed);
-                return Ok(());
-            }
-        };
-        if verified.webid.len() > MAX_WEBID_BYTES {
-            fail(ws, ErrorCode::AuthFailed);
-            return Ok(());
-        }
-        if !self.take_jti(&verified.jti, verified.exp, now_ms() / 1000)? {
-            console_log!("room auth refused replay");
-            fail(ws, ErrorCode::AuthFailed);
-            return Ok(());
-        }
+        let sql = self.sql();
+        let verified =
+            match gate::verify_socket(&sql, &self.dir, token, proof, &htu, now, TAG).await? {
+                Ok(v) => v,
+                Err(code) => {
+                    fail(ws, code);
+                    return Ok(());
+                }
+            };
         if !self.admit(&verified.webid, now)? {
             fail(ws, ErrorCode::RoomFull);
             return Ok(());
@@ -229,6 +161,7 @@ impl Room {
         }
         .to_json();
         att.authed = true;
+        att.pending = false;
         att.webid = Some(verified.webid);
         att.rl = Some(RateLimiter::frames());
         ws.serialize_attachment(&att)?;
@@ -288,13 +221,11 @@ impl Room {
             at,
         }
         .to_json();
-        let members: Vec<String> = self
+        let rows: Vec<Member> = self
             .sql()
-            .exec("SELECT webid FROM members", None)?
-            .to_array::<Member>()?
-            .into_iter()
-            .map(|m| m.webid)
-            .collect();
+            .exec("SELECT webid, last_forward FROM members", None)?
+            .to_array()?;
+        let members: Vec<String> = rows.iter().map(|m| m.webid.clone()).collect();
         let plan = fanout::plan(&views, &members);
         for i in &plan.live {
             let _ = sockets[*i].send_with_str(&frame);
@@ -303,15 +234,37 @@ impl Room {
         let item = QueuedItem {
             room: room.to_string(),
             from: from.to_string(),
-            kind: kind.as_str().to_string(),
+            kind,
             url,
-            seq,
+            seq: seq as u64,
             at,
         };
         let body = serde_json::to_string(&item)?;
         let ns = self.env.durable_object("MAILBOX")?;
-        let mut forwards = Vec::with_capacity(plan.offline.len());
-        for member in &plan.offline {
+        // R10: at most one forward per (room, member) per 30 s. Stamped on
+        // attempt, so a failing mailbox cannot turn every ping into a
+        // sub-request either.
+        let due: Vec<&str> = plan
+            .offline
+            .iter()
+            .copied()
+            .filter(|m| {
+                let last = rows
+                    .iter()
+                    .find(|r| r.webid == *m)
+                    .and_then(|r| r.last_forward);
+                forward_due(last, at)
+            })
+            .collect();
+        let skipped = plan.offline.len() - due.len();
+        for member in &due {
+            self.sql().exec(
+                "UPDATE members SET last_forward = ? WHERE webid = ?",
+                vec![at.into(), member.to_string().into()],
+            )?;
+        }
+        let mut forwards = Vec::with_capacity(due.len());
+        for member in &due {
             let stub = ns.id_from_name(&sha256_hex(member))?.get_stub()?;
             let headers = Headers::new();
             headers.set("content-type", "application/json")?;
@@ -328,10 +281,11 @@ impl Room {
             .filter(|r| !matches!(r, Ok(resp) if resp.status_code() == 202))
             .count();
         console_log!(
-            "room ping live={} queued={} failed={}",
+            "room ping live={} queued={} failed={} skipped={}",
             plan.live.len(),
             results.len() - failed,
-            failed
+            failed,
+            skipped
         );
         Ok(())
     }
@@ -339,7 +293,10 @@ impl Room {
 
 impl DurableObject for Room {
     fn new(state: State, env: Env) -> Self {
-        let _ = state.storage().sql().exec(SCHEMA, None);
+        let sql = state.storage().sql();
+        let _ = sql.exec(SCHEMA, None);
+        let _ = sql.exec(gate::SCHEMA, None);
+        let _ = sql.exec(ADD_LAST_FORWARD, None);
         Self {
             state,
             env,
@@ -376,10 +333,9 @@ impl DurableObject for Room {
             host,
             webid: None,
             rl: None,
+            pending: false,
         })?;
-        if self.state.storage().get_alarm().await?.is_none() {
-            self.state.storage().set_alarm(AUTH_TIMEOUT_MS).await?;
-        }
+        gate::arm_auth_timeout(&self.state).await?;
         Response::from_websocket(pair.client)
     }
 
@@ -413,6 +369,10 @@ impl DurableObject for Room {
         };
 
         match frame {
+            ClientFrame::Auth { .. } if att.pending => {
+                fail(&ws, ErrorCode::BadFrame);
+                Ok(())
+            }
             ClientFrame::Auth { token, proof, .. } => {
                 self.authenticate(&ws, att, &token, &proof, now).await
             }
@@ -452,31 +412,11 @@ impl DurableObject for Room {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        let now = now_ms();
-        let mut closed = 0;
-        let mut next: Option<i64> = None;
-        for ws in self.state.get_websockets() {
-            let Some(a) = Self::attachment(&ws) else {
-                continue;
-            };
-            if a.authed {
-                continue;
-            }
-            let deadline = a.opened + AUTH_TIMEOUT_MS;
-            if deadline <= now {
-                fail(&ws, ErrorCode::AuthFailed);
-                closed += 1;
-            } else {
-                next = Some(next.map_or(deadline, |n| n.min(deadline)));
-            }
-        }
-        if closed > 0 {
-            console_log!("room alarm closed={}", closed);
-        }
-        // Re-arm only while unauthenticated sockets remain.
-        if let Some(d) = next {
-            self.state.storage().set_alarm(d - now).await?;
-        }
-        Response::ok("")
+        gate::auth_alarm(
+            &self.state,
+            |ws| Self::attachment(ws).filter(|a| !a.authed).map(|a| a.opened),
+            TAG,
+        )
+        .await
     }
 }
