@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_MEMBERS: i64 = 50;
 /// An unauthenticated socket is closed after this long.
 pub const AUTH_TIMEOUT_MS: i64 = 5_000;
+/// A socket whose auth verification is still in flight is closed this long
+/// after opening. A verify makes up to three 5 s fetches.
+pub const VERIFY_TIMEOUT_MS: i64 = 20_000;
+/// Delay before the alarm that drops an idle object's leftover storage.
+pub const CLEANUP_DELAY_MS: i64 = 10_000;
 /// Frames per socket per window.
 pub const FRAMES_PER_WINDOW: usize = 60;
 /// Auth verifications per object per window (ruling R9).

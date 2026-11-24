@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use oxrdf::{NamedOrBlankNode, Term};
+use oxttl::TurtleParser;
 use serde_json::Value;
 use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
 
@@ -13,7 +15,7 @@ use crate::auth::{AuthError, Directory};
 use crate::jwk::Jwk;
 
 pub const CACHE_TTL_S: i64 = 600;
-const SOLID_NS: &str = "http://www.w3.org/ns/solid/terms#";
+const OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
 const MAX_DOC_BYTES: usize = 512 * 1024;
 /// Bound on cached entries per map, so unauthenticated input cannot grow memory without limit.
 const MAX_CACHE_ENTRIES: usize = 1024;
@@ -173,7 +175,7 @@ impl Directory for FetchDirectory {
         }
         let doc_url = webid.split('#').next().unwrap_or(webid);
         let ttl = get(doc_url, "text/turtle", "profile").await?;
-        let issuers = oidc_issuers(&ttl);
+        let issuers = oidc_issuers(&ttl, doc_url, webid);
         store(&self.issuers, webid, issuers.clone(), now);
         Ok(issuers)
     }
@@ -227,85 +229,39 @@ pub fn parse_jwks(doc: &str) -> Result<Vec<Jwk>, AuthError> {
     Ok(keys.iter().filter_map(Jwk::from_value).collect())
 }
 
-/// Every `solid:oidcIssuer` object in a Turtle document, found with a small
-/// scan for that one predicate, not a full Turtle parser. It recognises the
-/// full IRI form and any prefix bound to the Solid terms namespace, follows
-/// comma separated object lists, and keeps only absolute https IRIs.
-pub fn oidc_issuers(ttl: &str) -> Vec<String> {
-    let mut predicates = vec![format!("<{SOLID_NS}oidcIssuer>")];
-    for prefix in solid_prefixes(ttl) {
-        predicates.push(format!("{prefix}:oidcIssuer"));
-    }
+/// The `solid:oidcIssuer` objects whose subject is exactly `webid`, from the
+/// Turtle profile document fetched at `doc_url`.
+///
+/// The document is parsed with a real Turtle parser (`oxttl`), so text inside
+/// string literals and comments is never read as a triple, and relative IRIs
+/// are resolved against `doc_url`. The subject must equal the WebID,
+/// fragment included, so a triple about another subject in the same document
+/// adds nothing. Only absolute https IRI objects count. Any syntax error
+/// yields no issuers at all (the auth is then refused) rather than a guess.
+pub fn oidc_issuers(ttl: &str, doc_url: &str, webid: &str) -> Vec<String> {
+    let Ok(parser) = TurtleParser::new().with_base_iri(doc_url) else {
+        return Vec::new();
+    };
     let mut out: Vec<String> = Vec::new();
-    for pred in &predicates {
-        let mut from = 0;
-        while let Some(pos) = ttl[from..].find(pred.as_str()) {
-            let start = from + pos;
-            let end = start + pred.len();
-            from = end;
-            let before_ok = ttl[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| c.is_whitespace() || c == ';' || c == '[');
-            let after_ok = ttl[end..]
-                .chars()
-                .next()
-                .is_none_or(|c| c.is_whitespace() || c == '<');
-            if !before_ok || !after_ok {
-                continue;
-            }
-            let mut rest = &ttl[end..];
-            loop {
-                rest = rest.trim_start();
-                let Some(r) = rest.strip_prefix('<') else {
-                    break;
-                };
-                let Some(close) = r.find('>') else { break };
-                let iri = &r[..close];
-                if is_https(iri)
-                    && !iri.contains(char::is_whitespace)
-                    && !out.iter().any(|o| o == iri)
-                {
-                    out.push(iri.to_string());
-                }
-                rest = r[close + 1..].trim_start();
-                match rest.strip_prefix(',') {
-                    Some(r) => rest = r,
-                    None => break,
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Prefix names bound to the Solid terms namespace by `@prefix` or `PREFIX`.
-fn solid_prefixes(ttl: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let target = format!("<{SOLID_NS}>");
-    for line in ttl.lines() {
-        let l = line.trim_start();
-        let rest = if let Some(r) = l.strip_prefix("@prefix") {
-            r
-        } else if l.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("prefix")) {
-            // get(..6) is Some only when byte 6 is a char boundary, so [6..] is safe.
-            &l[6..]
-        } else {
-            continue;
+    for triple in parser.for_slice(ttl.as_bytes()) {
+        let Ok(t) = triple else {
+            return Vec::new();
         };
-        let rest = rest.trim_start();
-        let Some(colon) = rest.find(':') else {
-            continue;
-        };
-        let name = &rest[..colon];
-        if !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-        {
+        if t.predicate.as_str() != OIDC_ISSUER {
             continue;
         }
-        if rest[colon + 1..].trim_start().starts_with(&target) {
-            out.push(name.to_string());
+        let NamedOrBlankNode::NamedNode(subject) = &t.subject else {
+            continue;
+        };
+        if subject.as_str() != webid {
+            continue;
+        }
+        let Term::NamedNode(iri) = &t.object else {
+            continue;
+        };
+        let iri = iri.as_str();
+        if is_https(iri) && !out.iter().any(|o| o == iri) {
+            out.push(iri.to_string());
         }
     }
     out
@@ -314,6 +270,13 @@ fn solid_prefixes(ttl: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOC: &str = "https://pod.example/alice/profile/card";
+    const WEBID: &str = "https://pod.example/alice/profile/card#me";
+
+    fn issuers(ttl: &str) -> Vec<String> {
+        oidc_issuers(ttl, DOC, WEBID)
+    }
 
     #[test]
     fn finds_issuers_with_solid_prefix_and_lists() {
@@ -325,7 +288,7 @@ mod tests {
     foaf:name "Alice".
 "#;
         assert_eq!(
-            oidc_issuers(ttl),
+            issuers(ttl),
             vec!["https://issuer.example/", "https://second.example"]
         );
     }
@@ -333,15 +296,111 @@ mod tests {
     #[test]
     fn finds_issuers_with_full_iri_and_other_prefix() {
         let ttl = "PREFIX s: <http://www.w3.org/ns/solid/terms#>\n<#me> s:oidcIssuer <https://a.example>.\n<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://b.example>.";
-        let mut got = oidc_issuers(ttl);
+        let mut got = issuers(ttl);
         got.sort();
         assert_eq!(got, vec!["https://a.example", "https://b.example"]);
     }
 
     #[test]
     fn ignores_lookalike_predicates_and_non_https() {
-        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n<#me> notsolid:oidcIssuer <https://evil.example>; solid:oidcIssuerX <https://evil2.example>; solid:oidcIssuer <http://plain.example>.";
-        assert!(oidc_issuers(ttl).is_empty());
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n@prefix notsolid: <http://example.org/solid#>.\n<#me> notsolid:oidcIssuer <https://evil.example>; solid:oidcIssuerX <https://evil2.example>; solid:oidcIssuer <http://plain.example>.";
+        assert!(issuers(ttl).is_empty());
+    }
+
+    #[test]
+    fn ignores_issuer_inside_string_literals() {
+        let ttl = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+<#me> solid:oidcIssuer <https://issuer.example>;
+    foaf:name "x\". <#me> solid:oidcIssuer <https://evil.example>. #";
+    foaf:nick 'solid:oidcIssuer <https://evil2.example>';
+    foaf:note """
+<#me> solid:oidcIssuer <https://evil3.example> .
+""", '''<#me> <http://www.w3.org/ns/solid/terms#oidcIssuer> <https://evil4.example>.'''.
+"#;
+        assert_eq!(issuers(ttl), vec!["https://issuer.example"]);
+    }
+
+    #[test]
+    fn ignores_issuer_inside_comments() {
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n# <#me> solid:oidcIssuer <https://evil.example>.\n<#me> solid:oidcIssuer <https://issuer.example> # ; solid:oidcIssuer <https://evil2.example>\n.";
+        assert_eq!(issuers(ttl), vec!["https://issuer.example"]);
+    }
+
+    #[test]
+    fn ignores_issuer_under_another_subject() {
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n\
+            <#me> solid:oidcIssuer <https://issuer.example>.\n\
+            <#mallory> solid:oidcIssuer <https://evil.example>.\n\
+            <> solid:oidcIssuer <https://evil2.example>.\n\
+            <https://other.example/card#me> solid:oidcIssuer <https://evil3.example>.\n\
+            [] solid:oidcIssuer <https://evil4.example>.\n\
+            <#me> <http://xmlns.com/foaf/0.1/knows> [ solid:oidcIssuer <https://evil5.example> ].";
+        assert_eq!(issuers(ttl), vec!["https://issuer.example"]);
+        // The same document read for another WebID gives that WebID's issuer.
+        assert_eq!(
+            oidc_issuers(ttl, DOC, &format!("{DOC}#mallory")),
+            vec!["https://evil.example"]
+        );
+    }
+
+    #[test]
+    fn resolves_relative_subject_against_document_url() {
+        // `<card#me>` relative to the profile container resolves to the WebID.
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n<card#me> solid:oidcIssuer <https://issuer.example>.";
+        assert_eq!(issuers(ttl), vec!["https://issuer.example"]);
+        // Against a different document it is a different subject.
+        assert!(oidc_issuers(ttl, "https://pod.example/bob/profile/card", WEBID).is_empty());
+    }
+
+    #[test]
+    fn pods_dev_style_profile_with_ns1_prefix() {
+        let ttl = r#"@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix schema: <http://schema.org/> .
+@prefix ldp: <http://www.w3.org/ns/ldp#> .
+@prefix ns0: <http://www.w3.org/ns/pim/space#> .
+@prefix ns1: <http://www.w3.org/ns/solid/terms#> .
+@prefix vcard: <http://www.w3.org/2006/vcard/ns#> .
+
+<https://pod.example/alice/profile/card>
+  a foaf:PersonalProfileDocument ;
+  foaf:maker <https://pod.example/alice/profile/card#me> ;
+  foaf:primaryTopic <https://pod.example/alice/profile/card#me> .
+
+<https://pod.example/alice/profile/card#me>
+  a schema:Person, foaf:Person ;
+  ldp:inbox <https://pod.example/alice/storage/inbox/> ;
+  ns0:storage <https://pod.example/alice/storage/> ;
+  ns1:account <https://pod.example/alice/storage/> ;
+  ns1:oidcIssuer <https://pod.example> ;
+  foaf:name "Alice (demo)" ;
+  vcard:fn "Alice (demo)" .
+"#;
+        assert_eq!(issuers(ttl), vec!["https://pod.example"]);
+    }
+
+    #[test]
+    fn syntax_error_gives_no_issuers() {
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n<#me> solid:oidcIssuer <https://issuer.example>.\nthis is not turtle\n";
+        assert!(issuers(ttl).is_empty());
+        assert!(oidc_issuers(ttl, "not a url", WEBID).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_does_not_panic() {
+        let ttl = "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n# abcdeé x \u{1F600}\n\
+                   <#me> <http://xmlns.com/foaf/0.1/name> \"é\u{1F600}\"; solid:oidcIssuer <https://issuer.example>, <https://é.example>.";
+        assert_eq!(
+            issuers(ttl),
+            vec!["https://issuer.example", "https://é.example"]
+        );
+        for cut in 0..ttl.len() {
+            if let Some(part) = ttl.get(..cut) {
+                let _ = issuers(part);
+            }
+        }
+        // Junk text must not panic either.
+        let _ = issuers("<<<\"\"\"'''@prefix : <#> . :a :b [ :c ( :d \"");
     }
 
     #[test]
@@ -353,22 +412,6 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].kid.as_deref(), Some("k1"));
         assert!(parse_jwks("nope").is_err());
-    }
-
-    #[test]
-    fn non_ascii_lines_do_not_panic() {
-        // Byte 6 falls inside the two byte 'é': slicing [..6] would panic.
-        let ttl = "abcdeé x\n  abcdeé\n\u{1F600}\u{1F600} y\nprefixé: <x>\nPRÉFIX s: <http://www.w3.org/ns/solid/terms#>\n\
-                   @prefix solid: <http://www.w3.org/ns/solid/terms#>.\n<#me> solid:oidcIssuer <https://issuer.example>; é solid:oidcIssuer <https://é.example>.";
-        assert_eq!(
-            oidc_issuers(ttl),
-            vec!["https://issuer.example", "https://é.example"]
-        );
-        for cut in 0..ttl.len() {
-            if let Some(part) = ttl.get(..cut) {
-                let _ = oidc_issuers(part);
-            }
-        }
     }
 
     #[test]

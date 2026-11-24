@@ -29,7 +29,7 @@ use worker::{
 };
 
 use crate::frames::{check_order, parse, ClientFrame, ErrorCode, Kind, ServerFrame};
-use crate::gate::{self, now_ms};
+use crate::gate::{self, now_ms, Schema};
 use crate::ids::sha256_hex;
 use crate::limits::AUTH_TIMEOUT_MS;
 use crate::profile::FetchDirectory;
@@ -169,6 +169,11 @@ struct Attachment {
 }
 
 #[derive(Deserialize)]
+struct Oldest {
+    at: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct Row {
     id: i64,
     room: String,
@@ -203,11 +208,23 @@ pub struct Mailbox {
     #[allow(dead_code)]
     env: Env,
     dir: FetchDirectory,
+    schema: Schema,
 }
 
 impl Mailbox {
     fn sql(&self) -> worker::SqlStorage {
-        self.state.storage().sql()
+        self.schema.sql(&self.state)
+    }
+
+    /// Drop expired items; the oldest remaining item's `at`, if any.
+    fn prune(&self, now: i64) -> Result<Option<i64>> {
+        let sql = self.sql();
+        sql.exec(
+            "DELETE FROM items WHERE at < ?",
+            vec![(now - MAX_AGE_MS).into()],
+        )?;
+        let oldest: Oldest = sql.exec("SELECT MIN(at) AS at FROM items", None)?.one()?;
+        Ok(oldest.at)
     }
 
     fn attachment(ws: &WebSocket) -> Option<Attachment> {
@@ -310,6 +327,8 @@ impl Mailbox {
             .count();
         if live == 0 {
             self.store(item, now_ms())?;
+            // The alarm keeps stored items to their 7 day expiry.
+            gate::arm_cleanup(&self.state).await?;
         }
         console_log!("mailbox enqueue live={}", live);
         Ok(Response::empty()?.with_status(202))
@@ -324,25 +343,28 @@ impl Mailbox {
         if !upgrade.eq_ignore_ascii_case("websocket") {
             return Response::error("Upgrade Required", 426);
         }
-        let host = match req.headers().get("Host")? {
-            Some(h) if !h.is_empty() => h,
-            _ => match (url.host_str(), url.port()) {
-                (Some(h), Some(p)) => format!("{h}:{p}"),
-                (Some(h), None) => h.to_string(),
-                _ => return Response::error("Bad Request", 400),
-            },
+        let Some(host) = gate::upgrade_host(req.headers().get("Host")?, &url) else {
+            return Response::error("Bad Request", 400);
         };
 
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
-        pair.server.serialize_attachment(&Attachment {
+        let att = Attachment {
             authed: false,
             opened: now_ms(),
             w,
             host,
             pending: false,
-        })?;
-        gate::arm_auth_timeout(&self.state).await?;
+        };
+        // Accepted already: a failure here must close the socket, or it
+        // would sit open with no attachment or no auth timeout.
+        let setup = match pair.server.serialize_attachment(&att) {
+            Ok(()) => gate::arm_auth_timeout(&self.state).await,
+            Err(e) => Err(e),
+        };
+        if setup.is_err() {
+            gate::internal_error(&pair.server, TAG);
+        }
         Response::from_websocket(pair.client)
     }
 
@@ -367,6 +389,12 @@ impl Mailbox {
                     return Ok(());
                 }
             };
+        // The alarm or the client may have closed the socket while the
+        // verify was in flight: then nothing is sent or drained.
+        if !gate::is_open(&self.state, ws) {
+            console_log!("mailbox auth dropped closed");
+            return Ok(());
+        }
         if sha256_hex(&verified.webid) != att.w {
             console_log!("mailbox auth refused not_owner");
             fail(ws, ErrorCode::AuthFailed);
@@ -391,13 +419,11 @@ impl Mailbox {
 
 impl DurableObject for Mailbox {
     fn new(state: State, env: Env) -> Self {
-        let sql = state.storage().sql();
-        let _ = sql.exec(SCHEMA, None);
-        let _ = sql.exec(gate::SCHEMA, None);
         Self {
             state,
             env,
             dir: FetchDirectory::new(),
+            schema: Schema::new(&[SCHEMA, gate::SCHEMA]),
         }
     }
 
@@ -414,6 +440,59 @@ impl DurableObject for Mailbox {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        if self.on_message(&ws, message).await.is_err() {
+            gate::internal_error(&ws, TAG);
+        }
+        Ok(())
+    }
+
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _was_clean: bool,
+    ) -> Result<()> {
+        let _ = ws.close(Some(1000), Some("bye"));
+        // Leftover auth rows, or expired items, are dropped by the alarm.
+        gate::arm_cleanup(&self.state).await
+    }
+
+    async fn websocket_error(&self, _ws: WebSocket, _error: worker::Error) -> Result<()> {
+        Ok(())
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let idle = gate::auth_alarm(
+            &self.state,
+            |ws| {
+                Self::attachment(ws)
+                    .filter(|a| !a.authed)
+                    .map(|a| (a.opened, a.pending))
+            },
+            TAG,
+        )
+        .await?;
+        if idle {
+            let now = now_ms();
+            match self.prune(now)? {
+                // Come back when the oldest item expires.
+                Some(at) => {
+                    self.state
+                        .storage()
+                        .set_alarm((at + MAX_AGE_MS - now + 1).max(1))
+                        .await?
+                }
+                None => gate::sweep_junk(&self.state, &self.schema, TAG).await?,
+            }
+        }
+        Response::ok("")
+    }
+}
+
+impl Mailbox {
+    async fn on_message(&self, ws: &WebSocket, message: WebSocketIncomingMessage) -> Result<()> {
+        let ws = ws.clone();
         let Some(att) = Self::attachment(&ws) else {
             fail(&ws, ErrorCode::BadFrame);
             return Ok(());
@@ -451,30 +530,6 @@ impl DurableObject for Mailbox {
                 Ok(())
             }
         }
-    }
-
-    async fn websocket_close(
-        &self,
-        ws: WebSocket,
-        _code: usize,
-        _reason: String,
-        _was_clean: bool,
-    ) -> Result<()> {
-        let _ = ws.close(Some(1000), Some("bye"));
-        Ok(())
-    }
-
-    async fn websocket_error(&self, _ws: WebSocket, _error: worker::Error) -> Result<()> {
-        Ok(())
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        gate::auth_alarm(
-            &self.state,
-            |ws| Self::attachment(ws).filter(|a| !a.authed).map(|a| a.opened),
-            TAG,
-        )
-        .await
     }
 }
 
@@ -625,6 +680,18 @@ mod tests {
         // An item larger than the budget still goes, alone in its frame.
         assert_eq!(split_frames(&items, 10), vec![0..1, 1..2, 2..3]);
         assert_eq!(split_frames(&items, usize::MAX), vec![0..3]);
+    }
+
+    #[test]
+    fn worst_case_attachment_fits_2kb() {
+        let att = Attachment {
+            authed: true,
+            opened: NOW,
+            w: "a".repeat(64),
+            host: "h".repeat(crate::gate::MAX_HOST_BYTES),
+            pending: true,
+        };
+        assert!(serde_json::to_string(&att).unwrap().len() < 2048);
     }
 
     #[test]

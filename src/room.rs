@@ -17,6 +17,7 @@ use worker::{
 
 use crate::fanout::{self, forward_due, SocketView};
 use crate::frames::{check_order, parse, ClientFrame, ErrorCode, Kind, ServerFrame};
+use crate::gate::Schema;
 use crate::gate::{self, now_ms};
 use crate::ids::{sha256_hex, valid_room_id};
 use crate::limits::{RateLimiter, AUTH_TIMEOUT_MS, MAX_MEMBERS};
@@ -77,11 +78,20 @@ pub struct Room {
     /// One directory per object, so its profile and JWKS cache is shared by
     /// every auth on this room.
     dir: FetchDirectory,
+    schema: Schema,
 }
 
 impl Room {
     fn sql(&self) -> worker::SqlStorage {
-        self.state.storage().sql()
+        self.schema.sql(&self.state)
+    }
+
+    fn member_count(&self) -> Result<i64> {
+        let total: N = self
+            .sql()
+            .exec("SELECT COUNT(*) AS n FROM members", None)?
+            .one()?;
+        Ok(total.n)
     }
 
     fn attachment(ws: &WebSocket) -> Option<Attachment> {
@@ -97,11 +107,8 @@ impl Room {
                 vec![webid.to_string().into()],
             )?
             .one()?;
-        if known.n == 0 {
-            let total: N = sql.exec("SELECT COUNT(*) AS n FROM members", None)?.one()?;
-            if total.n >= MAX_MEMBERS {
-                return Ok(false);
-            }
+        if known.n == 0 && self.member_count()? >= MAX_MEMBERS {
+            return Ok(false);
         }
         self.touch(webid, now)?;
         Ok(true)
@@ -148,6 +155,12 @@ impl Room {
                     return Ok(());
                 }
             };
+        // The alarm or the client may have closed the socket while the
+        // verify was in flight: then there is no one to admit.
+        if !gate::is_open(&self.state, ws) {
+            console_log!("room auth dropped closed");
+            return Ok(());
+        }
         if !self.admit(&verified.webid, now)? {
             fail(ws, ErrorCode::RoomFull);
             return Ok(());
@@ -289,13 +302,11 @@ impl Room {
 
 impl DurableObject for Room {
     fn new(state: State, env: Env) -> Self {
-        let sql = state.storage().sql();
-        let _ = sql.exec(SCHEMA, None);
-        let _ = sql.exec(gate::SCHEMA, None);
         Self {
             state,
             env,
             dir: FetchDirectory::new(),
+            schema: Schema::new(&[SCHEMA, gate::SCHEMA]),
         }
     }
 
@@ -309,28 +320,30 @@ impl DurableObject for Room {
         if !upgrade.eq_ignore_ascii_case("websocket") {
             return Response::error("Upgrade Required", 426);
         }
-        let host = match req.headers().get("Host")? {
-            Some(h) if !h.is_empty() => h,
-            _ => match (url.host_str(), url.port()) {
-                (Some(h), Some(p)) => format!("{h}:{p}"),
-                (Some(h), None) => h.to_string(),
-                _ => return Response::error("Bad Request", 400),
-            },
+        let Some(host) = gate::upgrade_host(req.headers().get("Host")?, &url) else {
+            return Response::error("Bad Request", 400);
         };
 
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
-        let now = now_ms();
-        pair.server.serialize_attachment(&Attachment {
+        let att = Attachment {
             authed: false,
-            opened: now,
+            opened: now_ms(),
             room,
             host,
             webid: None,
             rl: None,
             pending: false,
-        })?;
-        gate::arm_auth_timeout(&self.state).await?;
+        };
+        // Accepted already: a failure here must close the socket, or it
+        // would sit open with no attachment or no auth timeout.
+        let setup = match pair.server.serialize_attachment(&att) {
+            Ok(()) => gate::arm_auth_timeout(&self.state).await,
+            Err(e) => Err(e),
+        };
+        if setup.is_err() {
+            gate::internal_error(&pair.server, TAG);
+        }
         Response::from_websocket(pair.client)
     }
 
@@ -339,6 +352,56 @@ impl DurableObject for Room {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        if self.on_message(&ws, message).await.is_err() {
+            gate::internal_error(&ws, TAG);
+        }
+        Ok(())
+    }
+
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _was_clean: bool,
+    ) -> Result<()> {
+        if let Some(webid) = Self::attachment(&ws).and_then(|a| a.webid) {
+            self.touch(&webid, now_ms())?;
+        }
+        let _ = ws.close(Some(1000), Some("bye"));
+        // A room nobody was ever admitted to holds only auth rows: let the
+        // alarm drop them.
+        if self.member_count()? == 0 {
+            gate::arm_cleanup(&self.state).await?;
+        }
+        Ok(())
+    }
+
+    async fn websocket_error(&self, _ws: WebSocket, _error: worker::Error) -> Result<()> {
+        Ok(())
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let idle = gate::auth_alarm(
+            &self.state,
+            |ws| {
+                Self::attachment(ws)
+                    .filter(|a| !a.authed)
+                    .map(|a| (a.opened, a.pending))
+            },
+            TAG,
+        )
+        .await?;
+        if idle && self.member_count()? == 0 {
+            gate::sweep_junk(&self.state, &self.schema, TAG).await?;
+        }
+        Response::ok("")
+    }
+}
+
+impl Room {
+    async fn on_message(&self, ws: &WebSocket, message: WebSocketIncomingMessage) -> Result<()> {
+        let ws = ws.clone();
         let Some(mut att) = Self::attachment(&ws) else {
             fail(&ws, ErrorCode::BadFrame);
             return Ok(());
@@ -387,31 +450,28 @@ impl DurableObject for Room {
             }
         }
     }
+}
 
-    async fn websocket_close(
-        &self,
-        ws: WebSocket,
-        _code: usize,
-        _reason: String,
-        _was_clean: bool,
-    ) -> Result<()> {
-        if let Some(webid) = Self::attachment(&ws).and_then(|a| a.webid) {
-            self.touch(&webid, now_ms())?;
-        }
-        let _ = ws.close(Some(1000), Some("bye"));
-        Ok(())
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate::{MAX_HOST_BYTES, MAX_WEBID_BYTES};
 
-    async fn websocket_error(&self, _ws: WebSocket, _error: worker::Error) -> Result<()> {
-        Ok(())
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        gate::auth_alarm(
-            &self.state,
-            |ws| Self::attachment(ws).filter(|a| !a.authed).map(|a| a.opened),
-            TAG,
-        )
-        .await
+    #[test]
+    fn worst_case_attachment_fits_2kb() {
+        let mut rl = RateLimiter::frames();
+        let t0 = 1_800_000_000_000;
+        while rl.allow(t0 + rl.hits().len() as i64) {}
+        let att = Attachment {
+            authed: true,
+            opened: t0,
+            room: "0".repeat(32),
+            host: "h".repeat(MAX_HOST_BYTES),
+            webid: Some("w".repeat(MAX_WEBID_BYTES)),
+            rl: Some(rl),
+            pending: true,
+        };
+        let len = serde_json::to_string(&att).unwrap().len();
+        assert!(len < 2048, "attachment is {len} bytes");
     }
 }
