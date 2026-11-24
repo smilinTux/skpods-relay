@@ -3,8 +3,8 @@
 
 use serde_json::Value;
 use skpods_relay::frames::{parse, ErrorCode, ServerFrame};
-use skpods_relay::limits::RateLimiter;
 use skpods_relay::ids::valid_room_id;
+use skpods_relay::limits::RateLimiter;
 
 fn fixtures() -> Vec<Value> {
     let text = include_str!("relay-v1.fixtures.json");
@@ -26,7 +26,11 @@ fn fixtures_match_parser() {
         assert_eq!(got.is_ok(), valid, "fixture {name}");
         if let Some(close) = f.get("close").and_then(Value::as_u64) {
             let err = got.expect_err(name);
-            assert_eq!(u64::from(err.close()), close, "close code for fixture {name}");
+            assert_eq!(
+                u64::from(err.close()),
+                close,
+                "close code for fixture {name}"
+            );
         }
     }
     assert!(seen >= 10, "expected the client fixtures, saw {seen}");
@@ -52,13 +56,8 @@ fn server_error_fixtures_match_close_codes() {
 
 #[test]
 fn server_frames_match_fixtures() {
-    let by_name = |n: &str| {
-        fixtures()
-            .into_iter()
-            .find(|f| f["name"] == n)
-            .unwrap()["frame"]
-            .clone()
-    };
+    let by_name =
+        |n: &str| fixtures().into_iter().find(|f| f["name"] == n).unwrap()["frame"].clone();
     let alice = "https://alice.pods.example/profile/card#me";
     let url = "https://alice.pods.example/skpods/v1/chat/c-ab12/m-1732449600000-x9k2.ttl";
 

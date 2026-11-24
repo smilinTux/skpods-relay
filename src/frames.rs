@@ -319,7 +319,10 @@ mod tests {
     fn order_rule() {
         let auth = parse(r#"{"t":"auth","v":1,"token":"a","proof":"b"}"#).unwrap();
         assert_eq!(check_order(false, &auth), Ok(()));
-        assert_eq!(check_order(false, &ClientFrame::Typing), Err(FrameError::Bad));
+        assert_eq!(
+            check_order(false, &ClientFrame::Typing),
+            Err(FrameError::Bad)
+        );
         assert_eq!(check_order(true, &auth), Err(FrameError::Bad));
         assert_eq!(check_order(true, &ClientFrame::Typing), Ok(()));
     }

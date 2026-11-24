@@ -45,10 +45,22 @@ mod tests {
         let b = "https://b.example/#me";
         let c = "https://c.example/#me";
         let sockets = [
-            SocketView { is_sender: true, webid: Some(a) },
-            SocketView { is_sender: false, webid: Some(a) },
-            SocketView { is_sender: false, webid: None },
-            SocketView { is_sender: false, webid: Some(b) },
+            SocketView {
+                is_sender: true,
+                webid: Some(a),
+            },
+            SocketView {
+                is_sender: false,
+                webid: Some(a),
+            },
+            SocketView {
+                is_sender: false,
+                webid: None,
+            },
+            SocketView {
+                is_sender: false,
+                webid: Some(b),
+            },
         ];
         let members = vec![a.to_string(), b.to_string(), c.to_string()];
         let f = plan(&sockets, &members);
@@ -59,7 +71,10 @@ mod tests {
     #[test]
     fn unauthenticated_socket_does_not_count_as_online() {
         let a = "https://a.example/#me";
-        let sockets = [SocketView { is_sender: false, webid: None }];
+        let sockets = [SocketView {
+            is_sender: false,
+            webid: None,
+        }];
         let members = vec![a.to_string()];
         let f = plan(&sockets, &members);
         assert!(f.live.is_empty());

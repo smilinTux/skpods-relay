@@ -11,9 +11,8 @@
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{
-    console_log, durable_object, Date, DurableObject, Env, Headers, Method, Request,
-    RequestInit, Response, Result, State, WebSocket, WebSocketIncomingMessage,
-    WebSocketPair,
+    console_log, durable_object, Date, DurableObject, Env, Headers, Method, Request, RequestInit,
+    Response, Result, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
 use crate::auth::{self, AuthError};
@@ -243,7 +242,11 @@ impl Room {
         let sockets = self.state.get_websockets();
         let webids = sockets
             .iter()
-            .map(|s| Self::attachment(s).filter(|a| a.authed).and_then(|a| a.webid))
+            .map(|s| {
+                Self::attachment(s)
+                    .filter(|a| a.authed)
+                    .and_then(|a| a.webid)
+            })
             .collect();
         (sockets, webids)
     }
