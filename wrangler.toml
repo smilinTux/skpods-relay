@@ -1,0 +1,20 @@
+name = "skpods-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+workers_dev = true
+routes = [{ pattern = "relay.skpods.skworld.io", custom_domain = true }]
+
+[build]
+command = "worker-build --release"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room", "Mailbox"]
