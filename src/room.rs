@@ -30,10 +30,6 @@ CREATE TABLE IF NOT EXISTS members(webid TEXT PRIMARY KEY, last_seen INTEGER, la
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
 ";
 
-/// Rooms created before ruling R10 lack `last_forward`. Fails harmlessly
-/// once the column exists.
-const ADD_LAST_FORWARD: &str = "ALTER TABLE members ADD COLUMN last_forward INTEGER";
-
 /// Per-socket state, kept in the hibernatable attachment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Attachment {
@@ -296,7 +292,6 @@ impl DurableObject for Room {
         let sql = state.storage().sql();
         let _ = sql.exec(SCHEMA, None);
         let _ = sql.exec(gate::SCHEMA, None);
-        let _ = sql.exec(ADD_LAST_FORWARD, None);
         Self {
             state,
             env,

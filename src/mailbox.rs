@@ -20,6 +20,8 @@
 //! Logs carry counts and error codes only, never tokens, proofs, URLs or
 //! WebIDs.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 use worker::{
     console_log, durable_object, DurableObject, Env, Method, Request, Response, Result, State,
@@ -43,6 +45,11 @@ pub const ENQUEUE_URL: &str = "https://mailbox/internal/enqueue";
 pub const MAX_ITEMS: usize = 500;
 /// Items older than this are dropped.
 pub const MAX_AGE_MS: i64 = 7 * 86_400_000;
+
+/// Most serialized bytes per `queued` frame. A drain is split into several
+/// frames under this, well inside the runtime's 1 MiB WebSocket message
+/// limit (ruling R12: relay-to-client frames have no protocol cap).
+pub const FRAME_BUDGET: usize = 256 * 1024;
 
 const TAG: &str = "mailbox";
 
@@ -114,11 +121,39 @@ impl Queue {
 
     /// Every unexpired item, oldest first. The queue is empty afterwards.
     pub fn drain(&mut self, now_ms: i64) -> Vec<QueuedItem> {
-        let cutoff = now_ms - MAX_AGE_MS;
         let mut items = std::mem::take(&mut self.items);
-        items.retain(|i| i.at >= cutoff);
+        items.retain(|i| fresh(i.at, now_ms));
         items
     }
+}
+
+/// Whether an item stamped `at` is still within 7 days at `now_ms`.
+pub fn fresh(at: i64, now_ms: i64) -> bool {
+    at >= now_ms - MAX_AGE_MS
+}
+
+/// Split `items` into contiguous runs, in order, whose `queued` frame
+/// serializes to at most `budget` bytes. Every run holds at least one item
+/// (an item larger than the budget goes alone). Empty input gives one empty
+/// run, so the empty queue is still sent as one frame.
+pub fn split_frames(items: &[QueuedItem], budget: usize) -> Vec<Range<usize>> {
+    let overhead = ServerFrame::Queued(&[]).to_json().len();
+    let mut frames = Vec::new();
+    let mut start = 0;
+    let mut len = overhead;
+    for (i, item) in items.iter().enumerate() {
+        let size = serde_json::to_string(item).map_or(0, |s| s.len());
+        let add = if i == start { size } else { size + 1 };
+        if i > start && len + add > budget {
+            frames.push(start..i);
+            start = i;
+            len = overhead + size;
+        } else {
+            len += add;
+        }
+    }
+    frames.push(start..items.len());
+    frames
 }
 
 /// Per-socket state, kept in the hibernatable attachment.
@@ -224,10 +259,42 @@ impl Mailbox {
         Ok(())
     }
 
-    fn drain(&self, now: i64) -> Result<Vec<QueuedItem>> {
-        let (_, mut queue) = self.load()?;
-        self.sql().exec("DELETE FROM items", None)?;
-        Ok(queue.drain(now))
+    /// Send the stored queue to `ws` as one or more `queued` frames (one
+    /// empty frame when nothing is queued). Each frame's rows are deleted
+    /// only after its send succeeded; on a failed send the rest stays
+    /// stored. Synchronous: no await between read, send and delete.
+    fn deliver_queue(&self, ws: &WebSocket, now: i64) -> Result<usize> {
+        let (ids, queue) = self.load()?;
+        let sql = self.sql();
+        // Expired rows would be dropped by any drain anyway.
+        sql.exec(
+            "DELETE FROM items WHERE at < ?",
+            vec![(now - MAX_AGE_MS).into()],
+        )?;
+        let (ids, items): (Vec<i64>, Vec<QueuedItem>) = ids
+            .into_iter()
+            .zip(queue.items().iter().cloned())
+            .filter(|(_, i)| fresh(i.at, now))
+            .unzip();
+        let mut sent = 0;
+        for r in split_frames(&items, FRAME_BUDGET) {
+            if ws
+                .send_with_str(ServerFrame::Queued(&items[r.clone()]).to_json())
+                .is_err()
+            {
+                console_log!("mailbox drain send failed kept={}", items.len() - sent);
+                break;
+            }
+            if !r.is_empty() {
+                // Ids ascend with the queue order, so a frame is one id range.
+                sql.exec(
+                    "DELETE FROM items WHERE id >= ? AND id <= ?",
+                    vec![ids[r.start].into(), ids[r.end - 1].into()],
+                )?;
+            }
+            sent += r.len();
+        }
+        Ok(sent)
     }
 
     async fn enqueue(&self, mut req: Request) -> Result<Response> {
@@ -316,9 +383,8 @@ impl Mailbox {
         )?;
         // No await between marking the socket authed and draining, so a
         // forward cannot slip in between and be both stored and missed.
-        let items = self.drain(now_ms())?;
-        ws.send_with_str(ServerFrame::Queued(&items).to_json())?;
-        console_log!("mailbox auth ok drained={}", items.len());
+        let drained = self.deliver_queue(ws, now_ms())?;
+        console_log!("mailbox auth ok drained={}", drained);
         Ok(())
     }
 }
@@ -521,5 +587,48 @@ mod tests {
         assert_eq!(v["seq"], 7);
         let back: QueuedItem = serde_json::from_value(v).unwrap();
         assert_eq!(back, i);
+    }
+
+    fn frame_len(items: &[QueuedItem]) -> usize {
+        ServerFrame::Queued(items).to_json().len()
+    }
+
+    #[test]
+    fn split_keeps_each_frame_under_budget_in_order() {
+        let items: Vec<QueuedItem> = (0..500)
+            .map(|i| {
+                let long = format!("https://a.example/{}/m-{i}.ttl", "x".repeat(3_900));
+                item("r", &long, Kind::Message, i as u64, NOW)
+            })
+            .collect();
+        let frames = split_frames(&items, FRAME_BUDGET);
+        assert!(frames.len() > 1);
+        let mut next = 0;
+        for r in &frames {
+            assert_eq!(r.start, next, "contiguous, in order");
+            assert!(!r.is_empty(), "at least one item per frame");
+            assert!(frame_len(&items[r.clone()]) <= FRAME_BUDGET);
+            next = r.end;
+        }
+        assert_eq!(next, items.len(), "every item covered");
+    }
+
+    #[test]
+    fn split_exact_budget_and_oversize_item() {
+        let items: Vec<QueuedItem> = (0..3)
+            .map(|i| item("r", &url(i), Kind::Message, i as u64, NOW))
+            .collect();
+        // A budget of exactly two items' frame fits two, then one.
+        let two = frame_len(&items[..2]);
+        assert_eq!(split_frames(&items, two), vec![0..2, 2..3]);
+        assert_eq!(split_frames(&items, two - 1), vec![0..1, 1..2, 2..3]);
+        // An item larger than the budget still goes, alone in its frame.
+        assert_eq!(split_frames(&items, 10), vec![0..1, 1..2, 2..3]);
+        assert_eq!(split_frames(&items, usize::MAX), vec![0..3]);
+    }
+
+    #[test]
+    fn split_empty_gives_one_empty_frame() {
+        assert_eq!(split_frames(&[], FRAME_BUDGET), vec![0..0]);
     }
 }
