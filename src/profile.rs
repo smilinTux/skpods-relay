@@ -102,8 +102,9 @@ where
 }
 
 /// The one fetch helper for the WebID, discovery and JWKS documents: GET over
-/// https, redirects refused (a redirect could leave https or the expected
-/// host), a 5 s deadline that also aborts the subrequest, and a body cap of
+/// https, redirects not followed (manual mode, so any 3xx then fails the
+/// status check; a redirect could leave https or the expected host), a 5 s
+/// deadline that also aborts the subrequest, and a body cap of
 /// `MAX_DOC_BYTES` checked against `Content-Length` and again while streaming.
 async fn get(url: &str, accept: &str, what: &str) -> Result<String, AuthError> {
     if !is_https(url) {
@@ -117,7 +118,7 @@ async fn get(url: &str, accept: &str, what: &str) -> Result<String, AuthError> {
         let mut init = RequestInit::new();
         init.with_method(Method::Get)
             .with_headers(headers)
-            .with_redirect(RequestRedirect::Error);
+            .with_redirect(RequestRedirect::Manual);
         let req = Request::new_with_init(url, &init).map_err(fetch_err(what))?;
         let mut resp = Fetch::Request(req)
             .send_with_signal(&signal)
@@ -139,7 +140,12 @@ async fn get(url: &str, accept: &str, what: &str) -> Result<String, AuthError> {
     };
     let timer = worker::Delay::from(std::time::Duration::from_millis(FETCH_TIMEOUT_MS));
     match race(work, timer).await {
-        Some(result) => result,
+        Some(Ok(body)) => Ok(body),
+        Some(Err(e)) => {
+            // Close the subrequest now rather than leaving an unread body open.
+            controller.abort();
+            Err(e)
+        }
         None => {
             controller.abort();
             Err(AuthError::Fetch(format!("{what} timed out")))
